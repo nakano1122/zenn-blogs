@@ -1,0 +1,45 @@
+{
+  "name": "zenn",
+  "version": "1.0.0",
+  "description": "Zennの記事のまとめ",
+  "main": "index.js",
+  "scripts": {
+    "dev": "zenn preview",
+    "new:article": "zenn new:article",
+    "new:book": "zenn new:book",
+    "lint": "markdownlint-cli2 \"articles/**/*.md\" \"books/**/*.md\"",
+    "format": "prettier --write \"articles/**/*.md\" \"books/**/*.md\"",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "articles/**/*.md": [
+      "markdownlint-cli2 --fix",
+      "prettier --write"
+    ],
+    "books/**/*.md": [
+      "markdownlint-cli2 --fix",
+      "prettier --write"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nakano1122/zenn-blogs.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/nakano1122/zenn-blogs/issues"
+  },
+  "homepage": "https://github.com/nakano1122/zenn-blogs#readme",
+  "dependencies": {
+    "zenn-cli": "^0.4.7"
+  },
+  "devDependencies": {
+    "husky": "^9.1.7",
+    "lint-staged": "^16.4.0",
+    "markdownlint-cli2": "^0.22.0",
+    "prettier": "^3.8.3"
+  }
+}
