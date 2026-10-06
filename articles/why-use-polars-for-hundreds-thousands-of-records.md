@@ -6,41 +6,36 @@ topics: ["python", "polars", "machinelearning", "parquet"]
 published: true
 ---
 
+私は業務委託や研究で、数十万件規模のデータを使い、機械学習モデルを開発しています。モデル開発では、前処理、学習データの作成、評価、推論で同じデータを何度も読み込みます。工程ごとに全件を読み直すと、RAM を圧迫するだけでなく、不要な列や行を読む時間も積み重なります。
+
+当初は、読み込んだレコードを list にため、まとめて DataFrame へ変換していました。データ量が増えると、変換前の Python オブジェクトと変換後の列データが同時に RAM を使うため、メモリ不足（OOM）が発生しました。レコードを小分けにすると OOM は避けられましたが、Python で1行ずつ処理し、使わない列まで何度も読むため、今度は処理時間が問題になりました。
+
 :::details この記事で分かること
 
 - 逐次書き込みと scan_parquet を採用し、データ読込時のメモリ不足（OOM）を回避
-- LazyFrame でもメモリを圧迫する collect の判断基準
+- 結果を全件保持する collect の判断基準
 - collect_batches を採用し、GPU 推論へ渡すデータをバッチ単位に限定
   :::
 
-私は業務委託や研究で、数十万件規模のデータを扱う機械学習モデルを開発しています。モデル開発では、前処理、学習データの作成、評価、推論で同じデータを何度も読みます。データ量が増えるほど、データの持ち方によって処理時間と RAM 使用量が大きく変わります。
-
-当初は、読み込んだレコードを list にためてから DataFrame へ変換していました。データが増えるとメモリ不足（OOM）が発生しました。小分けにすると OOM は避けられましたが、Python で1行ずつ処理し、必要のない列まで何度も読み込むため、処理に時間がかかりました。
-
 ## Polars とは
 
-Polars は、構造化データを扱う DataFrame ライブラリです。コアは Rust で実装され、Python から利用できます。
+この OOM と処理時間の問題を解決するために、Polars を採用しました。Polars は構造化データを扱う DataFrame ライブラリで、Rust 製のコアを Python から利用できます。
 
-LazyFrame では、処理をすぐに実行せず、実行計画として保持します。実行前に計画全体を最適化するため、不要な列や行の読込を減らせます。ストリーミング実行に対応する処理は、データをバッチ単位で処理できます。
+LazyFrame は、処理をすぐに実行せず、実行計画として保持する仕組みです。実行前に計画全体を最適化するため、不要な列や行の読込を減らせます。また、ストリーミング実行に対応する処理では、データのバッチ処理が可能です。
 
 参照: [Polars User Guide](https://docs.pola.rs/user-guide/)、[Polars Lazy API](https://docs.pola.rs/user-guide/concepts/lazy-api/)、[Polars Streaming](https://docs.pola.rs/user-guide/concepts/streaming/)
 
-この特徴を使って処理を見直すと、RAM を使い切りやすい箇所は処理の流れに沿って4つありました。
+Parquet と Polars の遅延実行を組み合わせると、処理が進むにつれて現れるメモリ上の課題を段階的に狭められます。最初の対策は、生データを list にためない Parquet への逐次書き込みです。ただし、保存先を変えただけでは、読み込み時に全件が RAM に載るという課題が残ります。LazyFrame で必要な列と行を絞っても、collect すれば結果全体が DataFrame になるため、最後は外部ライブラリや GPU へ渡す単位の制限が必要です。
 
-- XML、JSON、ログから取り出した数十万件のイベントを list にためると、DataFrame を作る前に RAM を消費する
-- Parquet へ一定件数ごとに書き込んでも、read_parquet で全列を読むとデータ全体が RAM に載る
-- LazyFrame で読み取るデータ量を減らしても、collect の結果が大きければ DataFrame が RAM を圧迫する
-- モデル推論では LazyFrame のまま外部モデルへ渡せないため、Python オブジェクトとテンソルへ変換する境界を設計する必要がある
+この流れに合わせて、全件は Parquet に保存し、Python オブジェクト、Polars DataFrame、GPU メモリには処理中のデータだけを置く構成へ変更しました。
 
-そこで、全件は Parquet に保存し、Python、DataFrame、GPU には必要な範囲だけを置く構成へ変更しました。以降、この4箇所を順に見直します。
+以降は、この構成をイベントレコードと参照先エンティティのマスタで示します。基にしたのは実際の研究用コードですが、固有のデータ名や識別子は取り除きました。
 
-コードでは、イベントレコードと参照先エンティティのマスタを処理します。実際の研究用コードから、固有のデータ名や識別子を除いています。
+以降のコードは polars 1.43.2 以降が前提で、Parquet をバッチ単位で書き込む箇所では pyarrow 25.0.1 以降も使います。
 
-以降のコードは polars 1.43.2 以降が前提です。Parquet をバッチ単位で書き込む箇所では pyarrow 25.0.1 以降も使います。
+## データの保持範囲を決める
 
-## 解決の流れ
-
-4つの問題を解決するため、データの保持場所を次のように分けます。
+ピーク時の RAM 使用量を左右するのは、同時に保持するデータの量です。そこで、再利用する全件データは Parquet に置き、RAM と GPU メモリには次の処理に必要な範囲だけを読み込みます。
 
 | 保持場所            | 保持する範囲                   | 注意点                            |
 | ------------------- | ------------------------------ | --------------------------------- |
@@ -49,16 +44,11 @@ LazyFrame では、処理をすぐに実行せず、実行計画として保持�
 | Parquet             | 再利用する全データ             | 読み書きの回数が増えると遅くなる  |
 | GPU メモリ          | 推論中のバッチ                 | バッチサイズに強く制約される      |
 
-実装は次の順で進めます。
-
-1. 生データは逐次読み込み、一定件数ごとに Parquet へ保存する
-2. Parquet の整形は LazyFrame に積み、読取列・読取行を減らしてから実行する
-3. collect は小さい結果、または次の処理が DataFrame を必要とする境界に限定する
-4. モデルに渡すデータは collect_batches で分割し、出力もバッチごとに書き出す
+最初の対象は、DataFrame を作る前の Python オブジェクトです。この段階で全件を保持すると、後続の処理を最適化する前に OOM が発生するためです。
 
 ## 1. 生データを Parquet へ逐次書き込む
 
-イテレータから得たレコードをそのまま list にためる実装を避けます。
+イテレータから得たレコードを list にためると、DataFrame を作る前に全件分の Python オブジェクトが RAM に載ります。
 
 ```python
 # 避けたい例: records が全件の dict を保持
@@ -66,9 +56,9 @@ records = list(iter_events("events.xml"))
 pl.DataFrame(records).write_parquet("events.parquet")
 ```
 
-参照先のリストや大きな文字列を含むレコードでは、Python の dict と list が大きくなります。DataFrame への変換中は、Python 側と列指向データ側の両方を保持します。
+参照先のリストや大きな文字列を含むほど、各 dict が使う RAM は増えます。さらに、DataFrame への変換中は、変換前の Python オブジェクトと変換後の列データを二重に保持する状態です。
 
-入力はイテレータのまま読み、固定件数ごとに Parquet へ書き出します。
+この重複を避けるため、入力はイテレータのまま読み、固定件数ごとに Parquet へ書き出します。
 
 ```python
 from collections.abc import Iterator
@@ -107,13 +97,13 @@ write_parquet_batches(
 )
 ```
 
-このコードでも1バッチ分の Python オブジェクトは作ります。ただし保持量は、入力全体ではなく batch_size と1レコードの大きさで概ね決まります。文字列や参照先のリストが大きい場合は、batch_size も小さくします。
+このコードでも1バッチ分の Python オブジェクトは残ります。ただし、保持量の目安は入力全体ではなく、batch_size と1レコードの大きさです。1レコードが大きいほど同じ件数でも RAM を使うため、文字列や参照先のリストが大きい場合は batch_size の調整が必要です。
 
-これで、生データの読込時に保持する量を1バッチ分に抑えられます。次の課題は、Parquet を全件読み込むと、再びデータ全体が RAM に載ることです。
+これで、生データの読込時に保持する量を1バッチ分に抑えられます。ただし、解消できるのは保存時の OOM です。後続処理で Parquet を全件読み込めば、再びデータ全体が RAM に載るという課題が残ります。
 
 ## 2. LazyFrame で必要なデータだけを読む
 
-Parquet に保存しても、read_parquet でファイル全体を読み込むと全データが DataFrame になります。
+前節で全件を Parquet へ退避しましたが、read_parquet でファイル全体を読み込むと全データが DataFrame になります。
 
 ```python
 # 小規模データや対話的な探索には妥当ですが、全件が具体化されます
@@ -126,9 +116,9 @@ validation_events = (
 
 即座に DataFrame を得られるため、途中結果を確認する探索作業や、全件が RAM に収まる処理には適しています。
 
-全件を RAM に載せたくない処理では、scan_parquet から LazyFrame を作ります。必要な列と行を絞ってから実行できるためです。参照: [Polars Sources and Sinks](https://docs.pola.rs/user-guide/lazy/sources_sinks/)
+全件を RAM に載せたくない処理では、scan_parquet から LazyFrame を作ります。処理をすぐに実行しないため、必要な列と行を絞る操作まで含めて最適化できるからです。参照: [Polars Sources and Sinks](https://docs.pola.rs/user-guide/lazy/sources_sinks/)
 
-イベントが参照するマスタレコードの欠損を検出し、該当イベントを除外します。この処理では、走査、ネスト列の展開、結合、保存を LazyFrame のままつなぎます。
+ここで除外するのは、参照先のマスタレコードが欠けているイベントです。欠損の検出ではネスト列の展開によって行数が増えるため、展開後のデータを DataFrame として保持すると RAM を圧迫します。そこで、走査から保存までを LazyFrame のままつなぐ構成にします。
 
 ```python
 import polars as pl
@@ -160,13 +150,13 @@ valid_events = (
 valid_events.sink_parquet("events.parquet")
 ```
 
-explode はネストした参照先を1行ずつに展開するため、行数を増やします。欠損確認だけに使い、event_id を重複除去して元のイベントへ anti join します。展開後のデータは collect せず、そのまま結合に使います。
+explode は、ネストした参照先を1行ずつに分ける操作です。展開後は行数が増えるため、用途を欠損確認に限定します。欠損がある event_id を重複除去して元のイベントへ anti join すれば、展開結果の collect は不要です。
 
-scan_parquet はこの時点でデータ本体を読まず、実行計画だけを組み立てます。sink_parquet は実行の境界であり、結果を DataFrame に collect せず保存できます。参照: [Polars Sources and Sinks](https://docs.pola.rs/user-guide/lazy/sources_sinks/)
+scan_parquet はデータ全件を DataFrame にせず、実行計画を組み立てる入口です。sink_parquet はその計画を実行し、結果を DataFrame に collect せず保存します。参照: [Polars Sources and Sinks](https://docs.pola.rs/user-guide/lazy/sources_sinks/)
 
-Polars は実行前に計画を最適化します。projection pushdown では必要な列だけを読み、predicate pushdown では可能なフィルタを読込側へ寄せます。参照: [Polars Lazy API](https://docs.pola.rs/user-guide/concepts/lazy-api/)、[Polars Optimizations](https://docs.pola.rs/user-guide/lazy/optimizations/)
+LazyFrame のままつないだ処理は、実行前に計画全体を最適化する対象になります。projection pushdown は必要な列だけを読み、predicate pushdown は可能なフィルタを読込側へ寄せる最適化です。参照: [Polars Lazy API](https://docs.pola.rs/user-guide/concepts/lazy-api/)、[Polars Optimizations](https://docs.pola.rs/user-guide/lazy/optimizations/)
 
-次のように計画を確認できます。
+最適化が意図どおりに働くかは、explain で実行前に確認できます。
 
 ```python
 validation_events = (
@@ -178,15 +168,15 @@ validation_events = (
 print(validation_events.explain())
 ```
 
-出力には Parquet SCAN、PROJECT、SELECTION などが現れます。表記は Polars のバージョンで変わるため、文字列を固定したテストには向きません。必要な列だけを読んでいるか、SELECTION が Parquet SCAN に含まれているかを確認します。
+出力には Parquet SCAN、PROJECT、SELECTION などが現れます。Polars のバージョンによって表記が変わるため、文字列を固定したテストには不向きです。ここで確認するのは、必要な列だけを読み、SELECTION が Parquet SCAN に含まれているかという点です。
 
-これで Parquet から読む列と行を減らせます。ただし、最後に collect した結果は DataFrame として RAM に保持されます。
+これで Parquet から読む列と行を減らせます。ただし、LazyFrame が抑えるのは実行途中の無駄な読み込みです。最後に collect した結果は DataFrame になるため、その大きさによっては RAM を圧迫します。
 
 ## 3. collect は結果の大きさで判断する
 
-LazyFrame でも、collect の結果は DataFrame です。ストリーミング実行はデータをバッチ単位で処理しますが、返り値の DataFrame は全件保持されます。ストリーミングに対応していない処理は、インメモリエンジンへ切り替わります。参照: [Polars Streaming](https://docs.pola.rs/user-guide/concepts/streaming/)
+前節の処理を LazyFrame にしても、collect の結果は DataFrame です。ストリーミング実行でバッチ単位になるのは途中の処理に限られ、返り値の DataFrame には全件が保持されます。また、ストリーミングに対応していない処理がインメモリエンジンへ切り替わる点にも注意が必要です。参照: [Polars Streaming](https://docs.pola.rs/user-guide/concepts/streaming/)
 
-collect の位置は、次に渡す処理と結果の大きさで決めます。たとえば、学習対象のイベントが参照するエンティティ ID だけを取り出し、十分小さい場合に具体化します。
+そのため、collect は返される結果が RAM に収まり、次の処理が DataFrame や Python オブジェクトを必要とする位置で実行します。たとえば、学習対象のイベントが参照するエンティティ ID は、重複除去後の件数が十分小さい場合に限って具体化します。
 
 ```python
 training_entity_ids = (
@@ -207,7 +197,7 @@ training_entity_ids = (
 )
 ```
 
-training_entity_ids も RAM を使います。エンティティ ID のユニーク数が大きすぎるなら、この段階で全件を具体化しません。
+イベント数が多くても、参照するエンティティ ID の種類が少なければ、重複除去後の結果は小さくなります。一方、ユニーク数が大きい場合は training_entity_ids 自体が RAM を圧迫します。その場合の選択肢は、ID を collect せずに LazyFrame のまま結合するか、後述するバッチ単位での抽出です。
 
 ID の一覧と抽出後のレコードが RAM に収まる場合は、マスタから必要な2列だけを抜き出します。
 
@@ -220,15 +210,15 @@ entities_for_training = (
 )
 ```
 
-この collect が外部ライブラリとの境界です。Python の list や NumPy 配列へ変換する場合は、変換後のデータも含めて RAM に収まるか確認します。
+この collect が外部ライブラリとの境界です。ここから Python の list や NumPy 配列へ変換すると、DataFrame と変換後のデータを同時に保持する場合があります。必要な空き容量は抽出結果だけでなく、変換後のデータまで含めて判断します。
 
-ここまでは、外部ライブラリへ渡すデータが RAM に収まる場合の処理です。評価データ全体を GPU で推論する場合は、入力から出力までをバッチ単位に分けます。
+ここまでは、外部ライブラリへ渡すデータが RAM に収まる場合の処理です。評価データ全体が収まらない場合は collect の位置を遅らせるだけでは解決できないため、入力から出力までをバッチ単位に分けます。
 
 ## 4. Python と GPU の境界をバッチに閉じる
 
-モデル推論では、PyTorch などへ Python オブジェクトやテンソルを渡します。LazyFrame のまま GPU へは渡せません。
+モデル推論では、PyTorch などへ Python オブジェクトやテンソルを渡すため、LazyFrame のまま GPU へは渡せません。
 
-全評価データを collect し、参照先マスタをすべて dict にすると、Python オブジェクト、DataFrame、GPU テンソルが重なります。collect_batches で評価イベントを取り出し、そのバッチが参照するエンティティだけを読みます。この構造は、関連データを集めて外部モデルやライブラリへ渡す処理に使えます。
+全評価データを collect し、参照先マスタをすべて dict にすると、Python オブジェクト、DataFrame、GPU テンソルを同時に保持する状態です。この重なりを避けるため、collect_batches で評価イベントを取り出し、そのバッチが参照するエンティティだけを読みます。バッチの推論結果をすぐに書き出せば、次のバッチへ進む前に不要なオブジェクトを解放できます。
 
 ```python
 from pathlib import Path
@@ -289,24 +279,24 @@ predict_all(
 )
 ```
 
-RESULT_SCHEMA は出力列、predict は推論、to_result_table は Arrow 形式への変換を担います。保持する単位は次のとおりです。
+RESULT_SCHEMA は出力列、predict は推論、to_result_table は Arrow 形式への変換を担います。入力の取得から出力までをループ内に置くことで、保持する単位は次のようになります。
 
 1. batch は評価イベントの一部だけ
 2. records と features_by_id は、そのバッチが参照する分だけ
 3. GPU に載せる入力と中間テンソルは1バッチ分だけ
 4. 予測値は1バッチ分ずつ書き出す
 
-chunk_size は、1回に返すバッチの行数です。処理全体のメモリ上限ではありません。RAM と GPU メモリの両方を見て調整します。参照先の数や特徴量の大きさにばらつきがあれば、同じ行数でも必要なメモリは変わります。
+chunk_size は、1回に返すバッチの行数です。処理全体のメモリ上限を表す値ではありません。調整の基準は RAM と GPU メモリの両方であり、参照先の数や特徴量の大きさにばらつきがあれば、同じ行数でも必要なメモリは変わります。
 
-この構成では、バッチごとに参照先マスタを走査します。マスタを RAM に保持できる場合は最初に読み込み、保持できない場合はファイルの分割やキャッシュも検討します。
+この構成はピーク時の保持量を抑える一方で、バッチごとに参照先マスタを走査します。そのため、マスタを RAM に保持できる場合は最初に読み込み、保持できない場合はファイルの分割やキャッシュが選択肢です。
 
-collect_batches は仕様が安定しておらず、sink_parquet など Polars 内で完結する出力処理より低速です。Python や GPU へ渡す処理に限定し、Polars だけで完結する処理には sink_parquet を使います。Polars のバージョンを固定し、最大級の実データバッチを含む結合テストも用意します。参照: [polars.LazyFrame.collect_batches](https://docs.pola.rs/api/python/stable/reference/lazyframe/api/polars.LazyFrame.collect_batches.html)
+collect_batches は仕様が安定しておらず、sink_parquet など Polars 内で完結する出力処理より低速です。そのため、Python や GPU へ渡す処理に限定し、Polars だけで完結する処理には sink_parquet を使います。バージョンの固定に加えて、最大級の実データバッチを含む結合テストも必要です。参照: [polars.LazyFrame.collect_batches](https://docs.pola.rs/api/python/stable/reference/lazyframe/api/polars.LazyFrame.collect_batches.html)
 
-これで、外部モデルへ渡す Python オブジェクト、GPU テンソル、出力をバッチ単位に抑えられます。最後に、この構成が向く条件を整理します。
+この結果、外部モデルへ渡す Python オブジェクト、GPU テンソル、出力はバッチ単位に収まります。ただし、バッチ化には走査や変換のコストもあるため、採用の基準はデータの規模と後続処理です。
 
 ## Polars を採用する判断基準
 
-Polars がすべてのデータ処理に適しているとは限りません。次のように使い分けます。
+前節までの構成が効果的なのは、全件を RAM に保持できず、Parquet の絞り込みや結合を繰り返す場合です。一方、データが小さい場合や処理の大半が Python 側にある場合は、遅延実行やバッチ化で増える実装上の複雑さに対して、得られる効果は小さくなります。この差が、データ量と処理内容に応じて使い分ける基準です。
 
 | 状況                           | 採用しやすい理由                           | 注意点                                   |
 | ------------------------------ | ------------------------------------------ | ---------------------------------------- |
@@ -316,15 +306,10 @@ Polars がすべてのデータ処理に適しているとは限りません。�
 | 小規模な探索                   | read_parquet で簡潔に書ける                | 無理に LazyFrame だけへ統一しない        |
 | pandas 前提の評価ライブラリ    | 直前まで Polars で絞ってから変換できる     | 全件 to_pandas のサイズを確認する        |
 
-Polars を使っても、処理の大半を自前実装の関数が占めれば高速化は期待できません。map_elements は Polars の式より遅くなりやすいため、まず select や with_columns の中で、文字列式、リスト式、構造体式を組み合わせます。自前実装が必要な場合だけ対象を絞って使います。参照: [polars.Expr.map_elements](https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.map_elements.html)
+処理の大半を自前実装の関数にすると、Polars が最適化できる範囲から外れるため、高速化は期待できません。特に map_elements は Polars の式より遅くなりやすいため、優先するのは select や with_columns の中で文字列式、リスト式、構造体式を組み合わせる実装です。自前実装の関数は、必要な行まで絞った後に使います。参照: [polars.Expr.map_elements](https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.map_elements.html)
 
 ## まとめ
 
-数十万件の処理では、Polars の採用自体より、全件をどこに保持するかが重要です。
+数十万件の処理では、Polars を採用するだけで OOM を防げるわけではありません。生データを全件保持すると DataFrame を作る前に RAM を使い切るため、最初の対策は Parquet への逐次書き込みです。しかし、Parquet を全件読み込めば同じ問題が再発します。そこで、scan_parquet と LazyFrame によって、必要な列と行だけに読込範囲を絞ります。それでも collect の結果は RAM に載るため、実行するのは結果が十分小さい場合か、外部処理へ渡す直前だけです。外部処理へ渡すデータも大きい場合は、collect_batches で入力、Python オブジェクト、GPU テンソル、出力をバッチ内に閉じます。
 
-- 生データは逐次読み込み、Parquet を再利用可能な境界にする
-- 前処理は scan_parquet と LazyFrame に積み、explain で読み取る列と行を確認する
-- collect は小さい結果、または外部処理へ渡す直前に限定する
-- 推論時の Python オブジェクト、GPU テンソル、出力は collect_batches を使ってバッチに閉じる
-
-Parquet を中心に前処理・評価・推論をつなぐ機械学習パイプラインでは、必要なデータだけを読み、外部処理との境界でバッチ化できることが Polars を採用する理由です。
+scan_parquet で不要な列と行の読み込みを減らし、処理を Polars の式でつなぐと、Python で1行ずつ処理する範囲も減らせます。そのうえで、前の対策で残ったメモリ上の境界を次の対策で狭められることが、Parquet を中心とした機械学習パイプラインで Polars を採用する理由です。
