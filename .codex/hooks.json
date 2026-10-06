@@ -1,0 +1,19 @@
+{
+  "description": "Zenn ブログ執筆時の基本方針を読み込むプロジェクトフック。初回は Codex の /hooks で内容を確認して信頼する。",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/session-start.sh\"",
+            "statusMessage": "Loading Zenn writing context",
+            "timeout": 5,
+            "additionalContextLimit": 500
+          }
+        ]
+      }
+    ]
+  }
+}

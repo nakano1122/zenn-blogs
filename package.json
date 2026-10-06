@@ -8,6 +8,7 @@
     "new:article": "zenn new:article",
     "new:book": "zenn new:book",
     "lint": "markdownlint-cli2 \"articles/**/*.md\" \"books/**/*.md\"",
+    "lint:staged": "lint-staged",
     "format": "prettier --write \"articles/**/*.md\" \"books/**/*.md\"",
     "prepare": "husky"
   },
