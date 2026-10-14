@@ -9,6 +9,8 @@ Codex での執筆ルールは [AGENTS.md](AGENTS.md) に、記事作成と公�
 | 記事 | 公開日 |
 | --- | --- |
 | [AIを肩に乗せて研究する: Claude Codeで作る研究者向けエージェント基盤](https://zenn.dev/cafkaf/articles/48ad851b699c47) | 2026-04-20 |
+| [polarsで数十万件のデータ処理を高速化](https://zenn.dev/cafkaf/articles/why-use-polars-for-hundreds-thousands-of-records) | 2026-10-06 |
+| [pytorch-lightningで検索モデルをシンプルに実装する方法](https://zenn.dev/cafkaf/articles/pytorch-lightning-bi-encoder) | 2026-10-14 |
 
 ## 開発
 
